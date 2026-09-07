@@ -593,6 +593,15 @@ async function hasTurnstileFrame(page) {
     }
 }
 
+async function waitForTurnstileToken(page, timeoutMs = 12000) {
+    const startTime = Date.now();
+    while (Date.now() - startTime < timeoutMs) {
+        if (await checkTurnstileSuccess(page)) return true;
+        await page.waitForTimeout(500);
+    }
+    return false;
+}
+
 async function solveTurnstileIfPresent(page, stageName = "登录", maxAttempts = 10, waitAfterClick = 5000) {
     console.log(`[${stageName}] 开始检测 Cloudflare Turnstile...`);
     let sawTurnstile = false;
@@ -607,10 +616,9 @@ async function solveTurnstileIfPresent(page, stageName = "登录", maxAttempts =
         const clicked = await attemptTurnstileCdp(page);
         if (clicked) {
             sawTurnstile = true;
-            console.log(`[${stageName}] 已点击 Turnstile，等待验证结果 (${waitAfterClick}ms)...`);
-            await page.waitForTimeout(waitAfterClick);
-
-            if (await checkTurnstileSuccess(page)) {
+            console.log(`[${stageName}] 已点击 Turnstile，等待验证结果...`);
+            const tokenReady = await waitForTurnstileToken(page, waitAfterClick);
+            if (tokenReady) {
                 console.log(`[${stageName}] ✅ Turnstile 验证通过！`);
                 return true;
             }
@@ -624,6 +632,40 @@ async function solveTurnstileIfPresent(page, stageName = "登录", maxAttempts =
     }
     console.log(`[${stageName}] 检测到 Turnstile，但未能通过验证。`);
     return false;
+}
+
+// 登录提交后等待页面离开 /auth/login，确认登录结果。
+// 返回 { ok, reason: 'success' | 'credentials' | 'timeout', url, pageText }
+async function waitForLoginNavigation(page, timeoutMs = 25000) {
+    const credentialPatterns = [
+        'incorrect password or no account',
+        'incorrect password',
+        'invalid email or password',
+        'invalid credentials',
+        'wrong password',
+        'email or password',
+        'no account',
+        'mot de passe incorrect',
+        'identifiants incorrects',
+    ];
+    const startTime = Date.now();
+    while (Date.now() - startTime < timeoutMs) {
+        const currentUrl = page.url();
+        if (!currentUrl.includes('/auth/login') && !currentUrl.includes('login')) {
+            return { ok: true, reason: 'success', url: currentUrl };
+        }
+        try {
+            const bodyText = await page.locator('body').innerText({ timeout: 1500 }).catch(() => '');
+            const lowerText = bodyText.toLowerCase();
+            for (const pattern of credentialPatterns) {
+                if (lowerText.includes(pattern)) {
+                    return { ok: false, reason: 'credentials', url: currentUrl, pageText: bodyText.trim().slice(0, 300) };
+                }
+            }
+        } catch (e) { }
+        await page.waitForTimeout(800);
+    }
+    return { ok: false, reason: 'timeout', url: page.url() };
 }
 
 
@@ -1597,33 +1639,56 @@ async function switchMihomoProxy(name) {
 
                 await page.waitForTimeout(500);
                 await page.getByRole('button', { name: 'Login', exact: true }).click();
+                console.log('已点击 Login，等待登录结果...');
 
-                try {
-                    const errorMsg = page.getByText('Incorrect password or no account');
-                    if (await errorMsg.isVisible({ timeout: 3000 })) {
-                        console.error(`   >> ❌ 登录失败: 账号或密码错误`);
-                        const failPhotoDir = path.join(process.cwd(), 'screenshots');
-                        if (!fs.existsSync(failPhotoDir)) fs.mkdirSync(failPhotoDir, { recursive: true });
-                        const failSafe = user.username.replace(/[^a-z0-9]/gi, '_');
-                        const failScreenshot = path.join(failPhotoDir, `${failSafe}_login_fail.png`);
-                        try { await saveViewportScreenshot(page, failScreenshot); } catch (e) {}
-                        await sendTelegramMessage(`❌ *[@s5gydl] ${escapeMarkdown(user.username)}*\n登录失败: 账号或密码错误`, failScreenshot);
-                        stats.failed++;
-                        stats.failedAccounts.push(user.username);
-                        accountDatesInfo[user.username] = {
-                            status: "❌ 登录失败",
-                            nextDate: "未知",
-                            daysLeft: "未知",
-                            node: usedNode
-                        };
-                        accountSuccess = true; // Set true to break out of outer loop since password is wrong
-                        break;
+                const loginResult = await waitForLoginNavigation(page, 25000);
+
+                if (loginResult.reason === 'credentials') {
+                    console.error(`   >> ❌ 登录失败: 账号或密码错误`);
+                    const failPhotoDir = path.join(process.cwd(), 'screenshots');
+                    if (!fs.existsSync(failPhotoDir)) fs.mkdirSync(failPhotoDir, { recursive: true });
+                    const failSafe = user.username.replace(/[^a-z0-9]/gi, '_');
+                    const failScreenshot = path.join(failPhotoDir, `${failSafe}_login_fail.png`);
+                    try { await saveViewportScreenshot(page, failScreenshot); } catch (e) {}
+                    await sendTelegramMessage(`❌ *[@s5gydl] ${escapeMarkdown(user.username)}*\n登录失败: 账号或密码错误`, failScreenshot);
+                    stats.failed++;
+                    stats.failedAccounts.push(user.username);
+                    accountDatesInfo[user.username] = {
+                        status: "❌ 登录失败",
+                        nextDate: "未知",
+                        daysLeft: "未知",
+                        node: usedNode
+                    };
+                    accountSuccess = true; // Set true to break out of outer loop since password is wrong
+                    break;
+                }
+
+                if (!loginResult.ok) {
+                    // 超时仍停留在登录页：打印诊断信息辅助定位，按网络/风控问题切换节点重试
+                    console.error(`   >> ❌ 登录未完成: 等待 25 秒后仍在 ${loginResult.url || '登录页'}`);
+                    const failPhotoDir = path.join(process.cwd(), 'screenshots');
+                    if (!fs.existsSync(failPhotoDir)) fs.mkdirSync(failPhotoDir, { recursive: true });
+                    const failSafe = user.username.replace(/[^a-z0-9]/gi, '_');
+                    try {
+                        await saveViewportScreenshot(page, path.join(failPhotoDir, `${failSafe}_login_timeout.png`));
+                    } catch (e) {}
+                    if (loginResult.pageText) {
+                        console.error(`   >> 登录页可见文本: ${loginResult.pageText.slice(0, 200)}`);
                     }
-                } catch (e) { }
+                    accountFailureReason = "登录提交后未跳转(可能被防火墙拦截或网络过慢)";
+                    continue;
+                }
+
+                console.log(`✅ 登录成功，当前页面: ${loginResult.url}`);
 
                 const gotoViaSeeLink = async () => {
                     console.log('正在从服务器列表寻找 "See" 链接...');
                     try {
+                        if (page.url().includes('login')) {
+                            console.log('当前仍在登录页，无法定位服务器列表。');
+                            accountFailureReason = "登录会话未建立，无法找到服务器列表";
+                            return false;
+                        }
                         await page.getByRole('link', { name: 'See' }).first().waitFor({ timeout: 15000 });
                         await page.waitForTimeout(1000);
                         await page.getByRole('link', { name: 'See' }).first().click();
@@ -1642,6 +1707,12 @@ async function switchMihomoProxy(name) {
                     // 网站只认数字 ID；若填了十六进制 Identifier 会被静默重定向回 /dashboard，此时回落到列表路径
                     if (!page.url().includes('/servers/edit')) {
                         console.log(`⚠️ servers/edit?id=${user.serverId} 被重定向到 ${page.url()}`);
+                        if (page.url().includes('login')) {
+                            // 被踢回登录页说明会话未建立或已失效，属于登录失败而非 ID 填错
+                            console.log('⚠️ 被重定向到登录页，说明登录会话未建立。');
+                            accountFailureReason = "登录会话未建立，访问续期页被重定向到登录页";
+                            continue;
+                        }
                         console.log('⚠️ serverId 应为详情页 URL 中 id= 后的数字 ID，而非服务器 Identifier。改走服务器列表路径。');
                         if (!(await gotoViaSeeLink())) continue;
                     }
