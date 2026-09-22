@@ -1,4 +1,13 @@
 {
   "de***@oioio.eu.cc": "2026-09-06",
-  "ea***@hotmail.com": "25 September"
+  "ea***@hotmail.com": {
+    "v": 2,
+    "date": "2026-09-25",
+    "windowAt": 1790292600000,
+    "renewedAt": null,
+    "cycleHours": 96,
+    "skipNotifiedFor": 1790292600000,
+    "lastCheckedAt": null,
+    "raw": "25 September"
+  }
 }
