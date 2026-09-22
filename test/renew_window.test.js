@@ -145,13 +145,18 @@ test('windowAt=0（epoch）虽合法但应被视为缺失而非当前时刻', ()
     }
 });
 
-console.log('\n决策临界点（12h cron: 北京 07:20 / 19:20）');
+console.log('\n决策临界点（12h cron: 北京 05:20 / 17:20，实测 schedule 延迟 102~131 分钟）');
 const windowState = { v: 2, date: '2026-09-10', windowAt: at('2026-09-09T23:30:00Z'), renewedAt: null };
-test('北京 09-10 07:20 → wait（在作业内等到窗口开启，不跳过）', () => {
-    const d = W.decide(windowState, at('2026-09-09T23:20:00Z'));
+test('北京 09-10 05:20（零延迟到达）→ wait（等到 07:30 窗口开启）', () => {
+    const d = W.decide(windowState, at('2026-09-09T21:20:00Z'));
     eq(d.action, 'wait', 'action');
     eq(d.reason, 'window-imminent', 'reason');
-    eq(d.waitMs, 10 * 60 * 1000 + 30 * 1000, 'waitMs');
+    eq(d.waitMs, 130 * 60 * 1000 + 30 * 1000, 'waitMs');
+});
+test('北京 09-10 07:11（延迟 111 分钟到达）→ wait（仍赶在窗口前）', () => {
+    const d = W.decide(windowState, at('2026-09-09T23:11:00Z'));
+    eq(d.action, 'wait', 'action');
+    eq(d.waitMs, 19 * 60 * 1000 + 30 * 1000, 'waitMs');
 });
 test('北京 09-10 07:30:10 → run（窗口已开）', () => {
     const d = W.decide(windowState, at('2026-09-09T23:30:10Z'));
@@ -162,29 +167,29 @@ test('北京 09-10 07:31 → run（过了窗口也要跑，不能跳过）', () 
     const d = W.decide(windowState, at('2026-09-09T23:31:00Z'));
     eq(d.action, 'run', 'action');
 });
-test('北京 09-09 19:20（窗口开启前 12h）→ skip', () => {
-    const d = W.decide(windowState, at('2026-09-09T11:20:00Z'));
+test('北京 09-09 17:20（窗口前 14h）→ skip', () => {
+    const d = W.decide(windowState, at('2026-09-09T09:20:00Z'));
     eq(d.action, 'skip', 'action');
     eq(d.reason, 'too-early', 'reason');
     eq(d.daysLeft, 1, 'daysLeft');
 });
-test('续期成功后窗口推进 96h，当晚 19:20 再次 skip', () => {
-    // 07:30 成功 → renewedAt=窗口瞬间，windowAt 前进到 4 天后
-    const renewed = W.migrateState({ renewedAt: at('2026-09-09T23:30:00Z') }, { timeZone: TZ, cycleHours: 96 });
-    eq(renewed.windowAt, at('2026-09-13T23:30:00Z'), 'advanced windowAt');
-    const d = W.decide(renewed, at('2026-09-10T11:20:00Z'));
-    eq(d.action, 'skip', 'action');
-    eq(d.daysLeft, 4, 'daysLeft');
-});
-test('早上那次失败时，当晚 19:20 视为过期重试（有意为之）', () => {
-    const d = W.decide(windowState, at('2026-09-10T11:20:00Z'));
+test('延迟 180 分钟到达（窗口后 110 分钟）→ run 且标记 overdue', () => {
+    const d = W.decide(windowState, at('2026-09-10T01:20:00Z'));
     eq(d.action, 'run', 'action');
     eq(d.reason, 'window-overdue', 'reason');
 });
-test('北京 09-09 07:20（窗口前一天）→ skip', () => {
-    const d = W.decide(windowState, at('2026-09-08T23:20:00Z'));
+test('续期成功后窗口推进 96h，当天 17:20 再次 skip', () => {
+    // 07:30 成功 → renewedAt=窗口瞬间，windowAt 前进到 4 天后
+    const renewed = W.migrateState({ renewedAt: at('2026-09-09T23:30:00Z') }, { timeZone: TZ, cycleHours: 96 });
+    eq(renewed.windowAt, at('2026-09-13T23:30:00Z'), 'advanced windowAt');
+    const d = W.decide(renewed, at('2026-09-10T09:20:00Z'));
     eq(d.action, 'skip', 'action');
-    eq(d.daysLeft, 2, 'daysLeft');
+    eq(d.daysLeft, 4, 'daysLeft');
+});
+test('早上那次失败时，当天 17:20 视为过期重试（有意为之）', () => {
+    const d = W.decide(windowState, at('2026-09-10T09:20:00Z'));
+    eq(d.action, 'run', 'action');
+    eq(d.reason, 'window-overdue', 'reason');
 });
 test('窗口已过很久（Actions 延迟数小时）→ run 且标记 overdue', () => {
     const d = W.decide(windowState, at('2026-09-10T05:00:00Z'));
@@ -195,10 +200,16 @@ test('无窗口信息 → run（首次运行直接探测）', () => {
     eq(W.decide(null, Date.now()).action, 'run', 'null state');
     eq(W.decide(null, Date.now()).reason, 'no-window-known', 'reason');
 });
-test('等待预算：窗口 10 分钟内开启才在作业内等', () => {
-    const now = at('2026-09-09T23:20:00Z');
-    eq(W.nextRetryDelayMs(at('2026-09-09T23:30:00Z'), now), 10 * 60 * 1000 + 30 * 1000, 'in-budget');
-    eq(W.nextRetryDelayMs(at('2026-09-10T04:00:00Z'), now), null, 'out-of-budget');
+test('默认提前等待预算 4 小时（覆盖零延迟到达的整段空档）', () => {
+    eq(W.DEFAULT_EARLY_WAIT_MIN, 240, 'DEFAULT_EARLY_WAIT_MIN');
+    const win = at('2026-09-09T23:30:00Z');
+    eq(W.decide(windowState, win - 239 * 60 * 1000).action, 'wait', '239min');
+    eq(W.decide(windowState, win - 241 * 60 * 1000).action, 'skip', '241min');
+});
+test('等待预算：窗口在预算内才在作业内等', () => {
+    const now = at('2026-09-09T21:20:00Z');
+    eq(W.nextRetryDelayMs(at('2026-09-09T23:30:00Z'), now, { retryBudgetMs: 300 * 60 * 1000 }), 130 * 60 * 1000 + 30 * 1000, 'in-budget');
+    eq(W.nextRetryDelayMs(at('2026-09-11T04:00:00Z'), now, { retryBudgetMs: 300 * 60 * 1000 }), null, 'out-of-budget');
 });
 
 console.log(`\n[renew_window] 通过 ${passed}，失败 ${failures.length}\n`);

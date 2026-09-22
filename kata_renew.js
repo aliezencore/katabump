@@ -36,10 +36,12 @@ const SITE_TZ = (process.env.SITE_TZ || WindowLogic.DEFAULT_SITE_TZ).trim();
 const RENEW_CYCLE_HOURS = Number(process.env.RENEW_CYCLE_HOURS || WindowLogic.DEFAULT_CYCLE_HOURS);
 // 无 renewedAt 可用时（首次/旧数据），把站点日期当成该时刻的窗口开启
 const ANCHOR_TIME_OF_DAY = (process.env.RENEW_ANCHOR_TIME || WindowLogic.DEFAULT_ANCHOR_TIME).trim();
-// 距窗口 ≤ 该分钟数时，在作业内等待到窗口开启，而不是跳过等下一次 cron
+// 距窗口 ≤ 该分钟数时，在作业内等待到窗口开启，而不是跳过等下一次 cron。
+// 实测 GitHub schedule 延迟 102~131 分钟（中位约 111 分钟），因此 cron 必须提前
+// 数小时起跑；这个预算要能覆盖「提前到达」的整段空档（默认 5 小时）。
 const EARLY_WAIT_MIN = Number(process.env.RENEW_EARLY_WAIT_MIN || WindowLogic.DEFAULT_EARLY_WAIT_MIN);
-// 作业内轮询等窗口的预算（分钟）
-const RETRY_BUDGET_MIN = Number(process.env.RENEW_RETRY_BUDGET_MIN || 20);
+// 作业内等待窗口的预算（分钟）；GitHub 单 job 上限 6 小时
+const RETRY_BUDGET_MIN = Number(process.env.RENEW_RETRY_BUDGET_MIN || 300);
 
 function loadRenewDates() {
     if (fs.existsSync(RENEW_DATES_FILE)) {

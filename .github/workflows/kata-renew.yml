@@ -2,10 +2,13 @@ name: "@s5gydl kata 自动续期任务"
 
 on:
   schedule:
-    # 每 12 小时一次：UTC 23:20 / 11:20 = 北京时间 07:20 / 19:20
-    # 刻意提前到 :20（窗口在 07:30 开启），用 10 分钟余量吃掉 GitHub 定时任务的抖动；
-    # 脚本自身会在作业内等到窗口真正开启后再点 Renew，因此提前跑不会白跑。
-    - cron: '20 23,11 * * *'
+    # 每 12 小时一次：UTC 21:20 / 09:20 = 北京时间 05:20 / 17:20
+    # 为什么提前到 05:20 而不是贴着 07:30：
+    #   实测本仓库 GitHub schedule 延迟 102~131 分钟（中位约 111 分钟）。
+    #   若按 07:20 起跑，实际到达已约 09:10 —— 窗口(07:30)过了 1h40m，只能事后补救。
+    #   提前到 05:20 后，无论延迟 0 还是 2 小时，到达时刻都落在窗口之前，
+    #   脚本会在作业内等到窗口真正开启再点 Renew（见 RENEW_EARLY_WAIT_MIN / RETRY_BUDGET_MIN）。
+    - cron: '20 21,9 * * *'
   workflow_dispatch: # 允许手动触发
     inputs:
       debug:
@@ -59,9 +62,10 @@ jobs:
         # RENEW_ANCHOR_TIME=旧数据无「成功时刻」时，把站点日期当作该时刻开启窗口
         RENEW_ANCHOR_TIME: ${{ secrets.RENEW_ANCHOR_TIME || '07:30' }}
         # RENEW_EARLY_WAIT_MIN=距窗口多少分钟内就在本次作业里等到开启（而不是跳过）
-        RENEW_EARLY_WAIT_MIN: ${{ secrets.RENEW_EARLY_WAIT_MIN || '25' }}
-        # RENEW_RETRY_BUDGET_MIN=作业内轮询等窗口的预算（分钟）
-        RENEW_RETRY_BUDGET_MIN: ${{ secrets.RENEW_RETRY_BUDGET_MIN || '20' }}
+        # 默认 240 分钟：需覆盖「零延迟到达」时的整段空档（05:20 到达 → 07:30 窗口）
+        RENEW_EARLY_WAIT_MIN: ${{ secrets.RENEW_EARLY_WAIT_MIN || '240' }}
+        # RENEW_RETRY_BUDGET_MIN=作业内等待窗口的预算（分钟），GitHub 单 job 上限 6 小时
+        RENEW_RETRY_BUDGET_MIN: ${{ secrets.RENEW_RETRY_BUDGET_MIN || '300' }}
         DEBUG_SCREENSHOT: ${{ inputs.debug || secrets.DEBUG_SCREENSHOT || secrets.DEBUG || 'false' }}
         DEBUG: ${{ inputs.debug || secrets.DEBUG || secrets.DEBUG_SCREENSHOT || 'false' }}
       # 使用 xvfb-run 模拟有头环境运行

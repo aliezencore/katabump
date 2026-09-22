@@ -21,7 +21,16 @@ console.log(`\n[workflow] 校验 ${path.basename(file)}\n`);
 
 // 1. cron
 const cron = (yml.match(/- cron:\s*['"]([^'"]+)['"]/) || [])[1];
-ok('cron 为每 12 小时两次', cron === '20 23,11 * * *', `实际 ${cron}`);
+ok('cron 为每 12 小时两次（北京 05:20 / 17:20）', cron === '20 21,9 * * *', `实际 ${cron}`);
+
+// 1b. cron 必须显著早于窗口开启时刻：实测 schedule 延迟中位约 111 分钟，
+//     提前量不够的话到达时窗口已过，作业内等待形同虚设。
+const W = require('../lib/renew_window');
+const TZ = 'Asia/Shanghai';
+const windowAt = W.zonedToUtc(2026, 9, 10, 7, 30, 0, TZ);
+const cronArrival = W.zonedToUtc(2026, 9, 10, 5, 20, 0, TZ);
+const leadMin = Math.round((windowAt - cronArrival) / 60000);
+ok('cron 提前量足以吸收实测延迟(中位 111min)', leadMin > 111 + 10, `提前 ${leadMin} 分钟`);
 
 // 2. 环境变量透传（直接按行匹配，避免正则转义问题）
 const required = [
