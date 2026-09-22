@@ -1,0 +1,17 @@
+# 依赖与构建产物
+node_modules/
+package-lock.json
+
+# 运行期临时文件
+screenshots/
+chrome_err.log
+mihomo
+mihomo.gz
+mihomo.log
+config.yaml
+sub1.yaml
+*.tmp
+
+# 本地测试临时目录
+.tmp-*/
+.evidence/

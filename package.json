@@ -4,7 +4,9 @@
     "description": "Automation script for Katabump renewal",
     "main": "kata_renew.js",
     "scripts": {
-        "start": "node kata_renew.js"
+        "start": "node kata_renew.js",
+        "test": "node test/renew_window.test.js && node test/integration_renew_dates.test.js && node test/check_workflow.js",
+        "dry-run": "node kata_renew.js"
     },
     "dependencies": {
         "axios": "^1.18.0",

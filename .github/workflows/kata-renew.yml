@@ -2,8 +2,10 @@ name: "@s5gydl kata 自动续期任务"
 
 on:
   schedule:
-    # 每天 UTC 23:28 (北京时间 早上 7:28) 运行；错开整点，避开 GitHub 定时任务高峰减少延迟
-    - cron: '28 23 * * *'
+    # 每 12 小时一次：UTC 23:20 / 11:20 = 北京时间 07:20 / 19:20
+    # 刻意提前到 :20（窗口在 07:30 开启），用 10 分钟余量吃掉 GitHub 定时任务的抖动；
+    # 脚本自身会在作业内等到窗口真正开启后再点 Renew，因此提前跑不会白跑。
+    - cron: '20 23,11 * * *'
   workflow_dispatch: # 允许手动触发
     inputs:
       debug:
@@ -49,6 +51,17 @@ jobs:
         TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
         TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         TG_THREAD_ID: ${{ secrets.TG_THREAD_ID }}
+        # 续期窗口参数（都有内置默认值，不配也能跑；如需覆盖再在 Secrets 里加同名变量）
+        # SITE_TZ=站点时区，决定「日期」如何换算成绝对时刻，避免 runner(UTC) 与本地的 8 小时错位
+        SITE_TZ: ${{ secrets.SITE_TZ || 'Asia/Shanghai' }}
+        # RENEW_CYCLE_HOURS=站点续期周期（小时），站点为每 4 天一次
+        RENEW_CYCLE_HOURS: ${{ secrets.RENEW_CYCLE_HOURS || '96' }}
+        # RENEW_ANCHOR_TIME=旧数据无「成功时刻」时，把站点日期当作该时刻开启窗口
+        RENEW_ANCHOR_TIME: ${{ secrets.RENEW_ANCHOR_TIME || '07:30' }}
+        # RENEW_EARLY_WAIT_MIN=距窗口多少分钟内就在本次作业里等到开启（而不是跳过）
+        RENEW_EARLY_WAIT_MIN: ${{ secrets.RENEW_EARLY_WAIT_MIN || '25' }}
+        # RENEW_RETRY_BUDGET_MIN=作业内轮询等窗口的预算（分钟）
+        RENEW_RETRY_BUDGET_MIN: ${{ secrets.RENEW_RETRY_BUDGET_MIN || '20' }}
         DEBUG_SCREENSHOT: ${{ inputs.debug || secrets.DEBUG_SCREENSHOT || secrets.DEBUG || 'false' }}
         DEBUG: ${{ inputs.debug || secrets.DEBUG || secrets.DEBUG_SCREENSHOT || 'false' }}
       # 使用 xvfb-run 模拟有头环境运行

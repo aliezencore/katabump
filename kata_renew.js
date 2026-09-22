@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const http = require('http');
+const WindowLogic = require(path.join(__dirname, 'lib', 'renew_window.js'));
 
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
@@ -28,6 +29,17 @@ let stats = {
 };
 
 const RENEW_DATES_FILE = path.join(process.cwd(), 'renew_dates.json');
+
+// --- 续期窗口配置（可用环境变量覆盖，无需改代码）---
+// 站点时区：决定「日期」如何换算成绝对时刻，必须与站点一致，避免 runner(UTC) 与本地的 8 小时错位
+const SITE_TZ = (process.env.SITE_TZ || WindowLogic.DEFAULT_SITE_TZ).trim();
+const RENEW_CYCLE_HOURS = Number(process.env.RENEW_CYCLE_HOURS || WindowLogic.DEFAULT_CYCLE_HOURS);
+// 无 renewedAt 可用时（首次/旧数据），把站点日期当成该时刻的窗口开启
+const ANCHOR_TIME_OF_DAY = (process.env.RENEW_ANCHOR_TIME || WindowLogic.DEFAULT_ANCHOR_TIME).trim();
+// 距窗口 ≤ 该分钟数时，在作业内等待到窗口开启，而不是跳过等下一次 cron
+const EARLY_WAIT_MIN = Number(process.env.RENEW_EARLY_WAIT_MIN || WindowLogic.DEFAULT_EARLY_WAIT_MIN);
+// 作业内轮询等窗口的预算（分钟）
+const RETRY_BUDGET_MIN = Number(process.env.RENEW_RETRY_BUDGET_MIN || 20);
 
 function loadRenewDates() {
     if (fs.existsSync(RENEW_DATES_FILE)) {
@@ -146,33 +158,153 @@ function parseUsersString(raw) {
     return users;
 }
 
-// --- 辅助函数：解析到期时间 ---
+// --- 辅助函数：解析到期时间（统一按站点时区换算，不再依赖 runner 的本地时区）---
 function parseExpiryDate(dateStr) {
-    if (!dateStr || dateStr === 'Unknown Date' || dateStr.includes('未知')) return null;
-    let nextD;
-    // 如果是 YYYY-MM-DD 格式
-    if (dateStr.match(/^\d{4}-\d{2}-\d{2}$/)) {
-        nextD = new Date(dateStr);
-    } else {
-        // 如果是 12 July 格式
-        let currentYear = new Date().getFullYear();
-        nextD = new Date(`${dateStr} ${currentYear}`);
-        if (!isNaN(nextD.getTime())) {
-            let diff = Math.ceil((nextD.getTime() - Date.now()) / (1000 * 3600 * 24));
-            // 如果日期已经过去超过半年，说明是明年的日期
-            if (diff < -180) {
-                nextD = new Date(`${dateStr} ${currentYear + 1}`);
-            }
+    if (!dateStr || dateStr === 'Unknown Date' || String(dateStr).includes('未知')) return null;
+    const hint = WindowLogic.parseWindowHint(String(dateStr), {
+        timeZone: SITE_TZ,
+        nowMs: Date.now(),
+        anchorTimeOfDay: ANCHOR_TIME_OF_DAY
+    });
+    if (hint.windowAt === null) return null;
+    return WindowLogic.daysUntil(hint.windowAt, Date.now());
+}
+
+// --- 续期窗口状态：统一读写，兼容旧的「裸日期字符串」条目 ---
+function getAccountState(renewDates, dedupeKey) {
+    return WindowLogic.migrateState(renewDates[dedupeKey], {
+        timeZone: SITE_TZ,
+        nowMs: Date.now(),
+        cycleHours: RENEW_CYCLE_HOURS,
+        anchorTimeOfDay: ANCHOR_TIME_OF_DAY
+    });
+}
+
+function setAccountState(renewDates, dedupeKey, state) {
+    renewDates[dedupeKey] = state;
+    saveRenewDates(renewDates);
+}
+
+/** 记录一次「站点提示未到时间」：把提示文本换算成绝对窗口时刻 */
+function recordWindowHint(renewDates, dedupeKey, rawText, previousState) {
+    const hint = WindowLogic.parseWindowHint(rawText, {
+        timeZone: SITE_TZ,
+        nowMs: Date.now(),
+        anchorTimeOfDay: ANCHOR_TIME_OF_DAY
+    });
+    const state = {
+        v: 2,
+        date: hint.dateText || (previousState && previousState.date) || String(rawText || '').slice(0, 40) || '未知',
+        windowAt: hint.windowAt,
+        renewedAt: (previousState && previousState.renewedAt) || null,
+        cycleHours: RENEW_CYCLE_HOURS,
+        skipNotifiedFor: (previousState && previousState.skipNotifiedFor) || null,
+        lastCheckedAt: Date.now(),
+        raw: hint.raw || null
+    };
+    setAccountState(renewDates, dedupeKey, state);
+    return { hint, state };
+}
+
+/** 记录一次续期成功：窗口锚定在真实成功瞬间 + 周期 */
+function recordRenewSuccess(renewDates, dedupeKey, preciseDateText, previousState) {
+    const now = Date.now();
+    const windowAt = WindowLogic.computeWindowAt(now, RENEW_CYCLE_HOURS);
+    const state = {
+        v: 2,
+        date: preciseDateText || WindowLogic.formatInTz(windowAt, SITE_TZ).slice(0, 10),
+        windowAt,
+        renewedAt: now,
+        cycleHours: RENEW_CYCLE_HOURS,
+        skipNotifiedFor: null,
+        lastCheckedAt: now,
+        raw: (previousState && previousState.raw) || null
+    };
+    setAccountState(renewDates, dedupeKey, state);
+    return state;
+}
+
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, Math.max(0, ms)));
+}
+
+// --- 汇总报告（提前退出路径与正常路径共用）---
+function buildSummaryMessage(users, renewDates, accountDatesInfo, stats, proxyStats) {
+    let summaryMessage = `📊 *续期任务汇总报告*\n`;
+    summaryMessage += `📢 来源群组: @s5gydl\n\n`;
+
+    if (proxyStats && proxyStats.source && proxyStats.source !== 'NONE') {
+        summaryMessage += `🌐 *节点池状态* (${proxyStats.source}):\n`;
+        summaryMessage += `- 📥 提取总数: ${proxyStats.total}\n`;
+        summaryMessage += `- ✅ 健康有效: ${proxyStats.healthy}\n`;
+        summaryMessage += `- ❌ 测速失效: ${proxyStats.invalid}\n\n`;
+
+        if (proxyStats.invalidNodes && proxyStats.invalidNodes.length > 0) {
+            summaryMessage += `⚠️ *失效节点清单 (需维护)*:\n`;
+            proxyStats.invalidNodes.forEach(node => {
+                summaryMessage += `- ❌ \`${escapeMarkdown(node)}\`\n`;
+            });
+            summaryMessage += `\n`;
         }
     }
 
-    if (nextD && !isNaN(nextD.getTime())) {
-        return Math.ceil((nextD.getTime() - Date.now()) / (1000 * 3600 * 24));
+    summaryMessage += `🔹 总计账号: ${stats.total}\n`;
+    summaryMessage += `✅ 成功续期: ${stats.success}\n`;
+    summaryMessage += `⏳ 暂未到期: ${stats.skipped}\n`;
+    summaryMessage += `❌ 失败数量: ${stats.failed}\n\n`;
+
+    summaryMessage += `📅 *账号详细信息*:\n`;
+    users.forEach(user => {
+        let info = accountDatesInfo[user.username];
+        if (!info) {
+            info = { status: "未知", nextDate: "未知", daysLeft: "未知", node: "未知" };
+            // 键与写入时保持一致（脱敏账号），且值可能是新格式对象或旧的裸日期字符串
+            const rd = getAccountState(renewDates, maskUsernameForLog(user.username).toLowerCase());
+            if (rd) {
+                info.status = "⏳ 之前已成功";
+                info.nextDate = rd.date || WindowLogic.formatInTz(rd.windowAt, SITE_TZ);
+                const daysLeft = WindowLogic.daysUntil(rd.windowAt, Date.now());
+                if (daysLeft !== null) {
+                    info.daysLeft = daysLeft;
+                }
+            }
+        }
+
+        summaryMessage += `\n👤 \`${escapeMarkdown(user.username)}\`\n`;
+        summaryMessage += ` ├ 状态: ${info.status}\n`;
+        summaryMessage += ` ├ 节点: \`${escapeMarkdown(info.node)}\`\n`;
+        summaryMessage += ` └ 到期: ${escapeMarkdown(info.nextDate)} (剩 ${info.daysLeft} 天)\n`;
+    });
+
+    if (stats.failed > 0) {
+        summaryMessage += `\n⚠️ *失败账号清单*:\n`;
+        stats.failedAccounts.forEach(acc => {
+            summaryMessage += `- \`${escapeMarkdown(acc)}\`\n`;
+        });
     }
-    return null;
+
+    return summaryMessage;
+}
+
+/**
+ * 预判本次运行是否全部为「还早、跳过」。
+ * 12 小时一次的排程下，多数运行属于这种情况：此时没必要拉起 Chrome + Playwright。
+ * @returns {{allSkip:boolean, plans:Array}}
+ */
+function planAccounts(users, renewDates) {
+    const plans = users.map((user) => {
+        const dedupeKey = maskUsernameForLog(user.username).toLowerCase();
+        const state = getAccountState(renewDates, dedupeKey);
+        const decision = WindowLogic.decide(state, Date.now(), { earlyWaitMin: EARLY_WAIT_MIN });
+        return { user, dedupeKey, state, decision };
+    });
+    return { allSkip: plans.length > 0 && plans.every(p => p.decision.action === 'skip'), plans };
 }
 
 // --- 辅助函数：发送 Telegram（图文合并为一条消息） ---
+// TG_API_BASE 可覆盖（自建反代 / 本地 mock 测试用），默认官方 API
+const TG_API_BASE = (process.env.TG_API_BASE || 'https://api.telegram.org').replace(/\/+$/, '');
+
 async function sendTelegramMessage(message, imagePath = null) {
     if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
     try {
@@ -184,7 +316,7 @@ async function sendTelegramMessage(message, imagePath = null) {
             form.append('photo', fs.createReadStream(imagePath));
             form.append('caption', message);
             form.append('parse_mode', 'Markdown');
-            await axios.post(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto`, form, {
+            await axios.post(`${TG_API_BASE}/bot${TG_BOT_TOKEN}/sendPhoto`, form, {
                 headers: form.getHeaders()
             });
             console.log('[Telegram] Photo with caption sent.');
@@ -195,7 +327,7 @@ async function sendTelegramMessage(message, imagePath = null) {
                 parse_mode: 'Markdown'
             };
             if (TG_THREAD_ID) payload.message_thread_id = TG_THREAD_ID;
-            await axios.post(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, payload);
+            await axios.post(`${TG_API_BASE}/bot${TG_BOT_TOKEN}/sendMessage`, payload);
             console.log('[Telegram] Message sent.');
         }
     } catch (e) {
@@ -1478,6 +1610,46 @@ async function switchMihomoProxy(name) {
     let proxyIndex = 0;
     let proxyStats = { total: 0, healthy: 0, invalid: 0, source: 'NONE', invalidNodes: [] };
 
+    // DRY_RUN=1：只打印本次会做什么，不联网、不改 renew_dates.json。
+    // 用来核对「窗口时刻 / 该跑还是该等」是否符合预期。
+    if (['true', '1', 'yes', 'on'].includes(String(process.env.DRY_RUN || '').trim().toLowerCase())) {
+        const preview = planAccounts(users, renewDates);
+        console.log(`\n[DRY_RUN] 站点时区=${SITE_TZ} 周期=${RENEW_CYCLE_HOURS}h 提前等待=${EARLY_WAIT_MIN}min 当前=${WindowLogic.formatInTz(Date.now(), SITE_TZ)}`);
+        for (const plan of preview.plans) {
+            const windowText = WindowLogic.formatInTz(plan.decision.windowAt, SITE_TZ);
+            const daysLeft = plan.decision.daysLeft === undefined || plan.decision.daysLeft === null ? '未知' : plan.decision.daysLeft;
+            console.log(`  ${maskUsernameForLog(plan.user.username)} → ${plan.decision.action.toUpperCase()} (${plan.decision.reason})，窗口 ${windowText}，剩 ${daysLeft} 天`);
+        }
+        console.log(`[DRY_RUN] 全跳过=${preview.allSkip}，未做任何网络请求与写入。\n`);
+        process.exit(0);
+    }
+
+    // 全部账号都还没到窗口 → 直接发汇总并退出，不启动浏览器、也不建立代理池。
+    // 12 小时一次的排程下多数运行属于这种情况，这一步能省掉整轮 Chrome/Playwright 开销。
+    const preflight = planAccounts(users, renewDates);
+    if (preflight.allSkip) {
+        console.log('[预检] 所有账号均未到续期窗口，跳过代理池与浏览器启动。');
+        for (const plan of preflight.plans) {
+            const windowText = WindowLogic.formatInTz(plan.decision.windowAt, SITE_TZ);
+            console.log(`[跳过] ${maskUsernameForLog(plan.user.username)} 窗口开启: ${windowText} (${SITE_TZ})，还剩 ${plan.decision.daysLeft} 天`);
+            stats.skipped++;
+            accountDatesInfo[plan.user.username] = {
+                status: "⏳ 暂未到期",
+                nextDate: plan.state ? plan.state.date : '未知',
+                daysLeft: plan.decision.daysLeft,
+                node: "本地缓存"
+            };
+            const cycleKey = plan.decision.windowAt;
+            if (!plan.state || plan.state.skipNotifiedFor !== cycleKey) {
+                await sendTelegramMessage(`⏳ *[@s5gydl] ${escapeMarkdown(plan.user.username)}*\n暂未到可续期时间 (已跳过)\n📅 窗口开启: \`${windowText}\` (${SITE_TZ}) (还剩 ${plan.decision.daysLeft} 天)`);
+                setAccountState(renewDates, plan.dedupeKey, Object.assign({}, plan.state, { skipNotifiedFor: cycleKey }));
+            }
+        }
+        await sendTelegramMessage(buildSummaryMessage(users, renewDates, accountDatesInfo, stats, proxyStats));
+        console.log('完成（全部未到窗口，未启动浏览器）。');
+        process.exit(0);
+    }
+
     // 单变量智能代理初始化（传入 PROXY_SOURCE 即可自动识别）
     if (PROXY_SOURCE) {
         const smartResult = await setupSmartProxyPool(PROXY_SOURCE);
@@ -1493,15 +1665,8 @@ async function switchMihomoProxy(name) {
         }
     }
 
-    if (proxyStats.source !== 'NONE') {
-        if (proxyPool.length === 0) {
-            console.log('[代理池] ⚠️ 警告：健康检查后未发现可用节点，将降级使用默认网络。');
-        } else {
-            console.log(`[代理池] 🚀 健康节点池已建立 (共 ${proxyPool.length} 个有效节点)，每个账号及其重试将依次轮换使用不同有效节点！\n`);
-        }
-    }
-
     let browser = null;
+
     for (let cdpAttempt = 1; cdpAttempt <= 3; cdpAttempt++) {
         try {
             await launchChrome(3);
@@ -1567,24 +1732,39 @@ async function switchMihomoProxy(name) {
 
         // renew_dates.json 是公开文件，键使用脱敏账号，避免提交真实邮箱
         const dedupeKey = maskUsernameForLog(user.username).toLowerCase();
-        let nextDateStr = renewDates[dedupeKey];
-        if (nextDateStr) {
-            let nextDate = new Date(nextDateStr);
-            if (!isNaN(nextDate.getTime())) {
-                if (Date.now() < nextDate.getTime()) {
-                    let daysLeft = Math.ceil((nextDate.getTime() - Date.now()) / (1000 * 3600 * 24));
-                    console.log(`[跳过] 账号 ${user.username} 还没到可续期时间，下次可续期: ${nextDateStr} (还剩 ${daysLeft} 天)`);
-                    stats.skipped++;
-                    accountDatesInfo[user.username] = {
-                        status: "⏳ 暂未到期",
-                        nextDate: nextDateStr,
-                        daysLeft: daysLeft,
-                        node: "本地缓存"
-                    };
-                    await sendTelegramMessage(`⏳ *[@s5gydl] ${escapeMarkdown(user.username)}*\n暂未到可续期时间 (已跳过)\n📅 到期/下次可续期: \`${nextDateStr}\` (还剩 ${daysLeft} 天)`);
-                    continue;
-                }
+        let accountState = getAccountState(renewDates, dedupeKey);
+        const decision = WindowLogic.decide(accountState, Date.now(), { earlyWaitMin: EARLY_WAIT_MIN });
+
+        if (decision.action === 'skip') {
+            const windowText = WindowLogic.formatInTz(decision.windowAt, SITE_TZ);
+            const daysLeft = decision.daysLeft;
+            console.log(`[跳过] 账号 ${maskUsernameForLog(user.username)} 还没到可续期时间，窗口开启: ${windowText} (${SITE_TZ})，还剩 ${daysLeft} 天`);
+            stats.skipped++;
+            accountDatesInfo[user.username] = {
+                status: "⏳ 暂未到期",
+                nextDate: accountState ? accountState.date : '未知',
+                daysLeft: daysLeft,
+                node: "本地缓存"
+            };
+            // 12h 一次排程下同一窗口周期只通知一次，避免刷屏
+            const cycleKey = decision.windowAt;
+            if (!accountState || accountState.skipNotifiedFor !== cycleKey) {
+                await sendTelegramMessage(`⏳ *[@s5gydl] ${escapeMarkdown(user.username)}*\n暂未到可续期时间 (已跳过)\n📅 窗口开启: \`${windowText}\` (${SITE_TZ}) (还剩 ${daysLeft} 天)`);
+                accountState = Object.assign({}, accountState, { skipNotifiedFor: cycleKey });
+                setAccountState(renewDates, dedupeKey, accountState);
             }
+            continue;
+        }
+
+        if (decision.action === 'wait') {
+            const windowText = WindowLogic.formatInTz(decision.windowAt, SITE_TZ);
+            const waitMin = (decision.waitMs / 60000).toFixed(1);
+            console.log(`[等待] 账号 ${maskUsernameForLog(user.username)} 窗口 ${windowText} (${SITE_TZ}) 即将开启，本次作业内等待 ${waitMin} 分钟后立即续期...`);
+            await sleep(decision.waitMs);
+            console.log(`[等待] 窗口已开启 (${WindowLogic.formatInTz(Date.now(), SITE_TZ)})，开始执行续期。`);
+        } else if (decision.reason === 'window-overdue') {
+            const overdueMin = Math.round(-decision.deltaMs / 60000);
+            console.log(`[补偿] 账号 ${maskUsernameForLog(user.username)} 窗口已过 ${overdueMin} 分钟 (可能上次失败/定时延迟)，本次立即重试续期。`);
         }
 
         let accountSuccess = false;
@@ -1859,6 +2039,7 @@ async function switchMihomoProxy(name) {
                         }
 
                             let hasCaptchaError = false;
+                            let waitThenRetryMs = null;
                             try {
                                 const startVerifyTime = Date.now();
                                 while (Date.now() - startVerifyTime < 3000) {
@@ -1870,21 +2051,32 @@ async function switchMihomoProxy(name) {
                                     const notTimeLoc = page.getByText("You can't renew your server yet");
                                     if (await notTimeLoc.isVisible()) {
                                         const text = await notTimeLoc.innerText().catch(() => '');
-                                        const match = text.match(/as of\s+(.*?)\s+\(/);
+                                        // 站点原文一律打印，便于核对措辞（日期/相对时长两种格式都可能出现）
+                                        console.log(`   >> ⏳ 暂无法续期 (还没到时间)。站点原文: ${JSON.stringify(text.replace(/\s+/g, ' ').trim())}`);
+                                        const match = text.match(/as of\s+(.*?)\s*\(/);
                                         let dateStr = match ? match[1] : 'Unknown Date';
-                                        console.log(`   >> ⏳ 暂无法续期 (还没到时间)。下次可续期: ${dateStr}`);
+
+                                        // 解析站点提示 → 绝对窗口时刻（统一按站点时区，避免 runner(UTC) 8 小时错位）
+                                        const { hint, state } = recordWindowHint(renewDates, dedupeKey, text, accountState);
+                                        accountState = state;
+
+                                        if (hint.windowAt !== null) {
+                                            const windowText = WindowLogic.formatInTz(hint.windowAt, SITE_TZ);
+                                            dateStr = hint.dateText || windowText;
+                                            console.log(`   >> 已记录窗口: ${windowText} (${SITE_TZ}) [${hint.kind}]`);
+                                            // 窗口就在本次作业预算内开启（例如 cron 提前跑），则等待后原地重试
+                                            waitThenRetryMs = WindowLogic.nextRetryDelayMs(hint.windowAt, Date.now(), {
+                                                retryBudgetMs: RETRY_BUDGET_MIN * 60 * 1000
+                                            });
+                                        } else {
+                                            console.log(`   >> ⚠️ 无法从站点提示解析出窗口时刻，已保留原文待下次运行再判断。`);
+                                        }
+
+                                        const daysLeft = hint.windowAt !== null
+                                            ? WindowLogic.daysUntil(hint.windowAt, Date.now())
+                                            : '未知';
                                         renewPhaseSuccess = true;
                                         stats.skipped++;
-
-                                        let daysLeft = '未知';
-                                        if (dateStr !== 'Unknown Date') {
-                                            renewDates[dedupeKey] = dateStr;
-                                            saveRenewDates(renewDates);
-                                            let parsedDays = parseExpiryDate(dateStr);
-                                            if (parsedDays !== null) {
-                                                daysLeft = parsedDays;
-                                            }
-                                        }
                                         accountDatesInfo[user.username] = {
                                             status: "⏳ 时间未到",
                                             nextDate: dateStr,
@@ -1892,16 +2084,38 @@ async function switchMihomoProxy(name) {
                                             node: usedNode
                                         };
 
+                                        const cycleKey = hint.windowAt;
+                                        const shouldNotify = cycleKey === null || accountState.skipNotifiedFor !== cycleKey;
                                         const skipScreenshot = path.join(photoDir, `${safeUsername}_skip.png`);
                                         try { await saveViewportScreenshot(page, skipScreenshot); } catch (e) {}
-                                        await sendTelegramMessage(`⏳ *[@s5gydl] ${escapeMarkdown(user.username)}*\n暂无法续期 (时间未到)\n📅 到期/下次可续期: \`${dateStr}\` (还剩 ${daysLeft} 天)`, skipScreenshot);
+                                        if (shouldNotify) {
+                                            await sendTelegramMessage(`⏳ *[@s5gydl] ${escapeMarkdown(user.username)}*\n暂无法续期 (时间未到)\n📅 窗口开启: \`${dateStr}\` (还剩 ${daysLeft} 天)`, skipScreenshot);
+                                            if (cycleKey !== null) {
+                                                accountState = Object.assign({}, accountState, { skipNotifiedFor: cycleKey });
+                                                setAccountState(renewDates, dedupeKey, accountState);
+                                            }
+                                        } else {
+                                            console.log('   >> 同一窗口周期已通知过，跳过重复通知。');
+                                        }
                                         break;
                                     }
                                     await page.waitForTimeout(200);
                                 }
                             } catch (e) { }
 
-                            if (renewPhaseSuccess) break;
+                            if (renewPhaseSuccess) {
+                                if (waitThenRetryMs !== null && waitThenRetryMs > 0) {
+                                    console.log(`   >> 窗口将在 ${(waitThenRetryMs / 60000).toFixed(1)} 分钟内开启，本次作业内等待后重试续期...`);
+                                    await sleep(waitThenRetryMs);
+                                    await page.reload();
+                                    await page.waitForTimeout(3000);
+                                    if (page.url().includes('login')) break;
+                                    renewPhaseSuccess = false;
+                                    stats.skipped = Math.max(0, stats.skipped - 1);
+                                    continue; // 回到 Renew 尝试循环，此时窗口应已开启
+                                }
+                                break;
+                            }
 
                             if (hasCaptchaError) {
                                 console.log('   >> 验证码未通过，刷新页面重试...');
@@ -1921,17 +2135,18 @@ async function switchMihomoProxy(name) {
 
                                 let accurateDate = "已续期(待下次更新)";
                                 let accurateDays = "约30";
+                                let siteReportedDate = null;
                                 try {
                                     const bodyText = await page.innerText('body').catch(() => '');
                                     const expiryMatch = bodyText.match(/Expiry\s*[\n\r]*\s*(\d{4}-\d{2}-\d{2}|\d{1,2}\s+[a-zA-Z]+(?:\s+\d{4})?)/i);
 
                                     if (expiryMatch) {
                                         accurateDate = expiryMatch[1];
+                                        siteReportedDate = accurateDate;
                                         let parsedDays = parseExpiryDate(accurateDate);
                                         if (parsedDays !== null) {
                                             accurateDays = parsedDays;
                                         }
-                                        renewDates[dedupeKey] = accurateDate;
                                     } else {
                                         const renewBtnCheck = page.getByRole('button', { name: 'Renew', exact: true }).first();
                                         if (await renewBtnCheck.isVisible()) {
@@ -1940,14 +2155,14 @@ async function switchMihomoProxy(name) {
                                             const notTimeLocCheck = page.getByText("You can't renew your server yet");
                                             if (await notTimeLocCheck.isVisible({ timeout: 3000 })) {
                                                 const text = await notTimeLocCheck.innerText().catch(() => '');
-                                                const match = text.match(/as of\s+(.*?)\s+\(/);
+                                                const match = text.match(/as of\s+(.*?)\s*\(/);
                                                 if (match) {
                                                     accurateDate = match[1];
+                                                    siteReportedDate = accurateDate;
                                                     let parsedDays = parseExpiryDate(accurateDate);
                                                     if (parsedDays !== null) {
                                                         accurateDays = parsedDays;
                                                     }
-                                                    renewDates[dedupeKey] = accurateDate;
                                                 }
                                             }
                                         }
@@ -1956,13 +2171,18 @@ async function switchMihomoProxy(name) {
                                     console.log("   >> 获取精确日期失败: " + e.message);
                                 }
 
+                                // 窗口锚定在「真实续期成功瞬间 + 周期」，而不是站点返回的裸日期零点
+                                const successState = recordRenewSuccess(renewDates, dedupeKey, siteReportedDate, accountState);
+                                accountState = successState;
+                                const nextWindowText = WindowLogic.formatInTz(successState.windowAt, SITE_TZ);
+                                console.log(`   >> 下次窗口已锚定: ${nextWindowText} (${SITE_TZ}) = 本次成功 + ${RENEW_CYCLE_HOURS}h`);
+
                                 const successScreenshot = path.join(photoDir, `${safeUsername}_success.png`);
                                 try { await saveViewportScreenshot(page, successScreenshot); } catch (e) {}
-                                await sendTelegramMessage(`✅ *[@s5gydl] ${escapeMarkdown(user.username)}*\n续期成功！\n📅 有效期更新至: \`${accurateDate}\` (还剩 ${accurateDays} 天)`, successScreenshot);
+                                await sendTelegramMessage(`✅ *[@s5gydl] ${escapeMarkdown(user.username)}*\n续期成功！\n📅 站点到期: \`${accurateDate}\` (剩 ${accurateDays} 天)\n⏰ 下次窗口: \`${nextWindowText}\` (${SITE_TZ})`, successScreenshot);
                                 renewPhaseSuccess = true;
                                 stats.success++;
 
-                                saveRenewDates(renewDates);
                                 accountDatesInfo[user.username] = {
                                     status: "✅ 续期成功",
                                     nextDate: accurateDate,
@@ -2027,59 +2247,7 @@ async function switchMihomoProxy(name) {
     } // <-- Missing closing brace for the users loop added here
 
     // --- 发送最终汇总报告 ---
-    let summaryMessage = `📊 *续期任务汇总报告*\n`;
-    summaryMessage += `📢 来源群组: @s5gydl\n\n`;
-
-    if (proxyStats.source !== 'NONE') {
-        summaryMessage += `🌐 *节点池状态* (${proxyStats.source}):\n`;
-        summaryMessage += `- 📥 提取总数: ${proxyStats.total}\n`;
-        summaryMessage += `- ✅ 健康有效: ${proxyStats.healthy}\n`;
-        summaryMessage += `- ❌ 测速失效: ${proxyStats.invalid}\n\n`;
-
-        if (proxyStats.invalidNodes && proxyStats.invalidNodes.length > 0) {
-            summaryMessage += `⚠️ *失效节点清单 (需维护)*:\n`;
-            proxyStats.invalidNodes.forEach(node => {
-                summaryMessage += `- ❌ \`${escapeMarkdown(node)}\`\n`;
-            });
-            summaryMessage += `\n`;
-        }
-    }
-
-    summaryMessage += `🔹 总计账号: ${stats.total}\n`;
-    summaryMessage += `✅ 成功续期: ${stats.success}\n`;
-    summaryMessage += `⏳ 暂未到期: ${stats.skipped}\n`;
-    summaryMessage += `❌ 失败数量: ${stats.failed}\n\n`;
-
-    summaryMessage += `📅 *账号详细信息*:\n`;
-    users.forEach(user => {
-        let info = accountDatesInfo[user.username];
-        if (!info) {
-             info = { status: "未知", nextDate: "未知", daysLeft: "未知", node: "未知" };
-             let rd = renewDates[user.username.toLowerCase()];
-             if (rd) {
-                 info.status = "⏳ 之前已成功";
-                 info.nextDate = rd;
-                 let parsedDays = parseExpiryDate(rd);
-                 if (parsedDays !== null) {
-                     info.daysLeft = parsedDays;
-                 }
-             }
-        }
-
-        summaryMessage += `\n👤 \`${escapeMarkdown(user.username)}\`\n`;
-        summaryMessage += ` ├ 状态: ${info.status}\n`;
-        summaryMessage += ` ├ 节点: \`${escapeMarkdown(info.node)}\`\n`;
-        summaryMessage += ` └ 到期: ${escapeMarkdown(info.nextDate)} (剩 ${info.daysLeft} 天)\n`;
-    });
-
-    if (stats.failed > 0) {
-        summaryMessage += `\n⚠️ *失败账号清单*:\n`;
-        stats.failedAccounts.forEach(acc => {
-            summaryMessage += `- \`${escapeMarkdown(acc)}\`\n`;
-        });
-    }
-
-    await sendTelegramMessage(summaryMessage);
+    await sendTelegramMessage(buildSummaryMessage(users, renewDates, accountDatesInfo, stats, proxyStats));
 
     console.log('完成。');
     await browser.close();
