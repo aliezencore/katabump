@@ -6,7 +6,7 @@
     "windowAt": 1790692802426,
     "renewedAt": 1790347202426,
     "cycleHours": 96,
-    "skipNotifiedFor": null,
+    "skipNotifiedFor": 1790692802426,
     "lastCheckedAt": 1790347202426,
     "raw": "You can't renew your server yet. You will be able to as of 25 September (in 1 day(s))."
   }
