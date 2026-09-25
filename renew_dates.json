@@ -2,12 +2,12 @@
   "de***@oioio.eu.cc": "2026-09-06",
   "ea***@hotmail.com": {
     "v": 2,
-    "date": "2026-09-25",
-    "windowAt": 1790292600000,
-    "renewedAt": null,
+    "date": "2026-09-30",
+    "windowAt": 1790692802426,
+    "renewedAt": 1790347202426,
     "cycleHours": 96,
-    "skipNotifiedFor": 1790292600000,
-    "lastCheckedAt": 1790294130730,
+    "skipNotifiedFor": null,
+    "lastCheckedAt": 1790347202426,
     "raw": "You can't renew your server yet. You will be able to as of 25 September (in 1 day(s))."
   }
 }
