@@ -2132,8 +2132,14 @@ async function switchMihomoProxy(name) {
                                 console.log('   >> ✅ Renew successful!');
 
                                 console.log('   >> 尝试获取续期后的精确日期...');
-                                await page.reload();
-                                await page.waitForTimeout(3000);
+                                // 站点续期成功后常自动导航/刷新页面，旧 page 句柄会失活，
+                                // reload 抛 "Not attached" 不能中断「记录续期成功」，兜底包 try/catch。
+                                try {
+                                    await page.reload();
+                                    await page.waitForTimeout(3000);
+                                } catch (e) {
+                                    console.log(`   >> 续期后页面已失活（${String(e.message).split('\n')[0]}），跳过 reload，按兜底记录续期成功。`);
+                                }
 
                                 let accurateDate = "已续期(待下次更新)";
                                 let accurateDays = "约30";
