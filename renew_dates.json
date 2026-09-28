@@ -1,1 +1,12 @@
-{}
+{
+  "hw***@gmail.com": {
+    "v": 2,
+    "date": "2026-10-01",
+    "windowAt": 1790811000000,
+    "renewedAt": null,
+    "cycleHours": 96,
+    "skipNotifiedFor": 1790811000000,
+    "lastCheckedAt": 1790559794506,
+    "raw": "You can't renew your server yet. You will be able to as of 01 October (in 3 day(s))."
+  }
+}
