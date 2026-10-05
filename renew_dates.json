@@ -1,12 +1,12 @@
 {
   "hw***@gmail.com": {
     "v": 2,
-    "date": "2026-10-05",
-    "windowAt": 1791160721920,
-    "renewedAt": 1790815121920,
+    "date": "2026-10-10",
+    "windowAt": 1791570831457,
+    "renewedAt": 1791225231457,
     "cycleHours": 96,
-    "skipNotifiedFor": 1791160721920,
-    "lastCheckedAt": 1790815121920,
+    "skipNotifiedFor": null,
+    "lastCheckedAt": 1791225231457,
     "raw": "You can't renew your server yet. You will be able to as of 01 October (in 3 day(s))."
   }
 }
